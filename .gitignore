@@ -1,0 +1,20 @@
+# your camera login and zones stay on your machine
+tapo_rtsp.txt
+tapo_mask.txt
+cctv.ini
+
+# models (download them yourself, see README)
+models/
+*.bin
+*.onnx
+*.pt
+*.dlc
+
+# build output, recordings, photos, logs
+build/
+out/
+clips/
+snapshots/
+*.mp4
+*.jpg
+*.log
