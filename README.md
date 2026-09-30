@@ -31,9 +31,10 @@ detections per second (4.5 ms each), first picture about 0.5 s after start.
   never trigger. Motion and people whose centre is inside a zone are ignored.
 * **Recording** (● button): when auto-record is on, a clip is written as soon as someone passes —
   with 2.5 s from *before* they appeared (a GPU ring buffer) and until 5 s after they left.
-  Right-click the button to choose the folder (for example another drive). Default:
-  `Videos\PulseX CCTV`.
-* **Photo** (camera button) and **open folder**.
+* **Photo** (camera button).
+* **Folder** (folder button): a menu that shows where clips and photos are saved, with
+  **Open folder** and **Choose folder…** (for example another drive). One folder for everything;
+  default `Videos\PulseX CCTV`.
 * **AI sharpening** (✦, optional): QuickSRNet on the NPU for the zoomed-in view.
 * **Live numbers** (ⓘ): decode, frame rate, NPU timings, detections — hidden unless you want them.
 
@@ -104,7 +105,7 @@ If Media Foundation cannot open the stream, the app falls back to an `ffmpeg.exe
 
 | Key | Meaning |
 |---|---|
-| `save_dir` | folder for clips and photos (right-click ● to choose it) |
+| `save_dir` | folder for clips and photos (folder button → Choose folder…) |
 | `auto_record` | 1 = record passers-by |
 | `ignore_top` | without exclusion zones: ignore everything above this height (0–0.95 of the picture, 0 = off) |
 

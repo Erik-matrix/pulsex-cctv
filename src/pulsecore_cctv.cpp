@@ -41,7 +41,7 @@ using namespace pcore::gui;
 
 static std::string exe_dir(){ char b[MAX_PATH]{}; GetModuleFileNameA(nullptr,b,MAX_PATH); std::string p=b;
     auto s=p.find_last_of("\\/"); return s==std::string::npos?std::string("."):p.substr(0,s); }
-static const char* PULSEX_CCTV_VERSION = "0.2";
+#define PULSEX_CCTV_VERSION "0.3"
 // 09-30 v0.2: every path this app builds itself is UTF-8 (the folder picker returns UTF-8; the recorder opens UTF-8)
 static std::wstring u8w(const std::string& s){ int n=MultiByteToWideChar(CP_UTF8,0,s.c_str(),(int)s.size(),nullptr,0);
     std::wstring w(n,L'\0'); if(n) MultiByteToWideChar(CP_UTF8,0,s.c_str(),(int)s.size(),&w[0],n); return w; }
@@ -88,9 +88,7 @@ static std::string clips_dir(){
     return exe_dir()+"\\clips"; }
 static std::string snapshots_dir(){
     { std::string e=env_u8(L"PULSECORE_SNAPSHOTS"); if(!e.empty()) return e; }
-    if(!g_save_dir.empty()) return g_save_dir;
-    { std::string p=known_folder_u8(FOLDERID_Pictures); if(!p.empty()) return p+"\\PulseX CCTV"; }
-    return exe_dir()+"\\snapshots";   // fallback if USERPROFILE is somehow unset
+    return clips_dir();               // 09-30: one folder for clips AND photos (the chosen one, else Videos\PulseX CCTV)
 }
 
 // Live pipe format: RAW RGBA (no MJPEG re-encode/decode) — resolution is nearly CPU-free, only memory bandwidth.
@@ -523,7 +521,7 @@ struct Cctv {
         }
     }
 
-    // Save the current live frame as a timestamped JPEG in the chosen folder (default Pictures\PulseX CCTV).
+    // Save the current live frame as a timestamped JPEG in the clips-and-photos folder.
     void save_photo(){
         std::string dir=snapshots_dir(); std::error_code ec; std::filesystem::create_directories(std::filesystem::u8path(dir),ec);
         std::time_t t=std::time(nullptr); std::tm lt{}; localtime_s(&lt,&t);
@@ -714,6 +712,30 @@ static bool icon_btn(const char* id, float sz, bool active, const char* tip, voi
 }
 
 // ── the dock (09-30): centred, rounded, under the video; mode text + receipt under it ───────────────────────────────
+// 09-30: the Windows folder picker in its own STA thread (the render loop keeps drawing); the result is taken over
+// by the render thread (g.picked_dir). Used by the folder button's menu and the right-click on the record button.
+static void pick_folder(){
+    if(g.picking.exchange(true)) return;
+    std::string start=clips_dir(); HWND owner=GetActiveWindow();
+    std::thread([start,owner](){
+        std::string res; if(SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED|COINIT_DISABLE_OLE1DDE))){
+            IFileOpenDialog* dlg=nullptr;
+            if(SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&dlg)))){
+                DWORD o=0; dlg->GetOptions(&o); dlg->SetOptions(o|FOS_PICKFOLDERS|FOS_FORCEFILESYSTEM|FOS_PATHMUSTEXIST);
+                dlg->SetTitle(L"Where should PulseX CCTV save clips and photos?");
+                IShellItem* si=nullptr; std::wstring ws=u8w(start);          // v0.2: UTF-8, and the nearest folder that exists
+                while(!ws.empty() && GetFileAttributesW(ws.c_str())==INVALID_FILE_ATTRIBUTES){ auto k=ws.find_last_of(L"\\/"); if(k==std::wstring::npos || k<3) break; ws.resize(k); }
+                if(SUCCEEDED(SHCreateItemFromParsingName(ws.c_str(),nullptr,IID_PPV_ARGS(&si)))){ dlg->SetFolder(si); si->Release(); }
+                if(SUCCEEDED(dlg->Show(owner))){ IShellItem* r=nullptr;
+                    if(SUCCEEDED(dlg->GetResult(&r))){ PWSTR p=nullptr;
+                        if(SUCCEEDED(r->GetDisplayName(SIGDN_FILESYSPATH,&p))){ int n=WideCharToMultiByte(CP_UTF8,0,p,-1,nullptr,0,nullptr,nullptr);
+                            res.resize(n>0? n-1 : 0); WideCharToMultiByte(CP_UTF8,0,p,-1,&res[0],n,nullptr,nullptr); CoTaskMemFree(p); }
+                        r->Release(); } }
+                dlg->Release(); }
+            CoUninitialize(); }
+        { std::lock_guard<std::mutex> lk(g.pick_mtx); g.picked_dir=res; }
+        g.picking=false; }).detach();
+}
 static bool dock_btn(const char* id, float sz, bool active, const char* tip, void(*paint)(ImDrawList*,ImVec2,float,ImU32)){
     ImVec2 p=ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton(id, ImVec2(sz,sz));
@@ -752,36 +774,31 @@ static void draw_dock(bool af, bool em, int ds){
     { const bool armed=g.rec.armed.load(); g_rec_live=g.rec.recording.load();
       std::string tip = g.dec_mode!=0? std::string("Recording needs GPU decode (Media Foundation) - it is using ffmpeg now")
           : std::string(armed? "Auto-record ON: a clip is saved when someone passes" : "Auto-record people who pass by")
-            + "\nSaved to " + clips_dir() + "\nRight-click to choose the folder";
+            + "\nSaved to " + clips_dir();
       at(GAP); if(dock_btn("##rec", B, armed, tip.c_str(), ic_rec)){ g.rec.armed=!armed; g_auto_record=!armed; save_settings(); }
-      if(ImGui::IsItemClicked(ImGuiMouseButton_Right) && !g.picking.exchange(true)){     // Windows folder picker, own STA thread
-          std::string start=clips_dir(); HWND owner=GetActiveWindow();
-          std::thread([start,owner](){
-              std::string res; if(SUCCEEDED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED|COINIT_DISABLE_OLE1DDE))){
-                  IFileOpenDialog* dlg=nullptr;
-                  if(SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&dlg)))){
-                      DWORD o=0; dlg->GetOptions(&o); dlg->SetOptions(o|FOS_PICKFOLDERS|FOS_FORCEFILESYSTEM|FOS_PATHMUSTEXIST);
-                      dlg->SetTitle(L"Where should PulseX CCTV save clips and photos?");
-                      IShellItem* si=nullptr; std::wstring ws=u8w(start);          // v0.2: UTF-8, and the nearest folder that exists
-                      while(!ws.empty() && GetFileAttributesW(ws.c_str())==INVALID_FILE_ATTRIBUTES){ auto k=ws.find_last_of(L"\\/"); if(k==std::wstring::npos || k<3) break; ws.resize(k); }
-                      if(SUCCEEDED(SHCreateItemFromParsingName(ws.c_str(),nullptr,IID_PPV_ARGS(&si)))){ dlg->SetFolder(si); si->Release(); }
-                      if(SUCCEEDED(dlg->Show(owner))){ IShellItem* r=nullptr;
-                          if(SUCCEEDED(dlg->GetResult(&r))){ PWSTR p=nullptr;
-                              if(SUCCEEDED(r->GetDisplayName(SIGDN_FILESYSPATH,&p))){ int n=WideCharToMultiByte(CP_UTF8,0,p,-1,nullptr,0,nullptr,nullptr);
-                                  res.resize(n>0? n-1 : 0); WideCharToMultiByte(CP_UTF8,0,p,-1,&res[0],n,nullptr,nullptr); CoTaskMemFree(p); }
-                              r->Release(); } }
-                      dlg->Release(); }
-                  CoUninitialize(); }
-              { std::lock_guard<std::mutex> lk(g.pick_mtx); g.picked_dir=res; }
-              g.picking=false; }).detach(); } }
+      if(ImGui::IsItemClicked(ImGuiMouseButton_Right)) pick_folder();                 // shortcut; the menu under the folder button is the way
+    }
     at(GAP); if(dock_btn("##cam", B, false, "Take photo", ic_cam)) g.save_photo();
-    at(GAP); if(dock_btn("##fold", B, false, "Open the folder with clips and photos", ic_folder)) g.open_snapshots();
+    { const bool open=ImGui::IsPopupOpen("##foldmenu");                     // 09-30: folder menu - where, open, choose
+      at(GAP); if(dock_btn("##fold", B, open, open? nullptr : "Clips and photos folder", ic_folder)) ImGui::OpenPopup("##foldmenu");
+      const ImVec2 mn=ImGui::GetItemRectMin(), mx=ImGui::GetItemRectMax();
+      ImGui::SetNextWindowPos(ImVec2((mn.x+mx.x)*0.5f, mn.y-10.0f), ImGuiCond_Appearing, ImVec2(0.5f,1.0f));
+      ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14,12)); ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8,9));
+      ImGui::PushStyleVar(ImGuiStyleVar_PopupRounding, 10.0f);
+      if(ImGui::BeginPopup("##foldmenu")){
+          ImGui::TextDisabled("Clips and photos are saved in");
+          ImGui::TextUnformatted(clips_dir().c_str());
+          ImGui::Separator();
+          if(ImGui::MenuItem("Open folder")) g.open_snapshots();
+          if(ImGui::MenuItem("Choose folder\xE2\x80\xA6", nullptr, false, !g.picking.load())) pick_folder();
+          ImGui::EndPopup(); }
+      ImGui::PopStyleVar(3); }
     sep();
     { bool so=g.sr_on.load();
       at(GAP); if(dock_btn("##sr", B, so, so? "AI sharpening on (QuickSRNet on the NPU, when zoomed in) - click to turn off"
                                             : "AI sharpening on the NPU when zoomed in (QuickSRNet)", ic_spark)) g.sr_on.store(!so); }
     if(rz){ at(GAP); if(dock_btn("##rz", B, false, "Reset zoom", ic_zoom)){ g.m_cx=0.5f; g.m_cy=0.5f; g.m_h=0.5f; } }
-    at(GAP); if(dock_btn("##info", B, g.show_info, g.show_info? "Hide the live numbers" : "Show live numbers (decode, fps, NPU) \xE2\x80\x94 PulseX CCTV 0.2", ic_info)) g.show_info=!g.show_info;
+    at(GAP); if(dock_btn("##info", B, g.show_info, g.show_info? "Hide the live numbers" : "Show live numbers (decode, fps, NPU) \xE2\x80\x94 PulseX CCTV " PULSEX_CCTV_VERSION, ic_info)) g.show_info=!g.show_info;
     ImGui::SetCursorScreenPos(ImVec2(ImGui::GetCursorStartPos().x+ImGui::GetWindowPos().x, o.y+dock_h));
     ImGui::Dummy(ImVec2(0,8));
     // mode text, then the receipt
