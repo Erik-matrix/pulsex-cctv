@@ -1,11 +1,12 @@
-// PulseCore CCTV — Tapo live-view monitor with on-NPU AUTO-FRAMING.
-// ffmpeg decodes the RTSP stream (hardware H.264 on the SoC) onto a pipe; a reader thread turns the freshest
-// JPEG into a DX11 texture. A second thread runs YOLOv10 on the Hexagon NPU ~6x/s, takes only the `person`
-// boxes, and feeds a smoothed control loop that drives a digital pan/zoom — rendered for free as a UV sub-rect
-// of the existing texture (like Windows Studio Effects "Automatic Framing"). No box drawing, no alerts.
+// PulseX CCTV — live RTSP camera view with on-NPU AUTO-FRAMING and automatic recording of passers-by.
+// Media Foundation decodes the stream on the GPU (DXVA) into D3D11 textures; the D3D11 video processor scales them
+// for the screen, for the NPU (two square 640x640 tiles) and for the 1080p recording ring. YOLO runs on the Hexagon
+// NPU through QNN every frame; person boxes drive a spring-damped digital pan/zoom (a UV sub-rect of the video,
+// like Windows Studio Effects "Automatic Framing"). ffmpeg on a pipe is the fallback decoder.
 #define STB_IMAGE_IMPLEMENTATION
 #include "third_party/stb_image.h"
 #define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STBIW_WINDOWS_UTF8                       // 09-30: file names are UTF-8 (photos in folders with non-ASCII names)
 #include "third_party/stb_image_write.h"
 #include "pcore_yolo_npu.hpp"                 // pcore_npu::NpuDetector (raw QNN YOLOv10 on the NPU)
 #include <pcore/gui/app_shell.hpp>
@@ -40,6 +41,15 @@ using namespace pcore::gui;
 
 static std::string exe_dir(){ char b[MAX_PATH]{}; GetModuleFileNameA(nullptr,b,MAX_PATH); std::string p=b;
     auto s=p.find_last_of("\\/"); return s==std::string::npos?std::string("."):p.substr(0,s); }
+static const char* PULSEX_CCTV_VERSION = "0.2";
+// 09-30 v0.2: every path this app builds itself is UTF-8 (the folder picker returns UTF-8; the recorder opens UTF-8)
+static std::wstring u8w(const std::string& s){ int n=MultiByteToWideChar(CP_UTF8,0,s.c_str(),(int)s.size(),nullptr,0);
+    std::wstring w(n,L'\0'); if(n) MultiByteToWideChar(CP_UTF8,0,s.c_str(),(int)s.size(),&w[0],n); return w; }
+static std::string w2u8(const wchar_t* w){ if(!w) return std::string(); int n=WideCharToMultiByte(CP_UTF8,0,w,-1,nullptr,0,nullptr,nullptr);
+    std::string r(n>0? n-1 : 0,'\0'); if(n>1) WideCharToMultiByte(CP_UTF8,0,w,-1,&r[0],n,nullptr,nullptr); return r; }
+static std::string env_u8(const wchar_t* name){ const wchar_t* v=_wgetenv(name); return (v && *v)? w2u8(v) : std::string(); }
+static std::string known_folder_u8(REFKNOWNFOLDERID id){          // Videos / Pictures, wherever the user moved them
+    PWSTR p=nullptr; std::string r; if(SUCCEEDED(SHGetKnownFolderPath(id,0,nullptr,&p))) r=w2u8(p); CoTaskMemFree(p); return r; }
 // The tool bin dir (ffmpeg's working folder) is overridable; default = this exe's folder.
 static std::string bin_dir(){ if(const char* e=std::getenv("PULSECORE_BIN")){ if(*e) return e; } return exe_dir(); }
 static std::string ffmpeg_exe(){ if(const char* e=std::getenv("PULSECORE_FFMPEG")){ if(*e) return e; }
@@ -61,25 +71,25 @@ static const char* yolo_ctx(){ if(const char* e=std::getenv("PULSECORE_YOLO_CTX"
 // 09-30: one storage folder for clips and photos, chosen by the user (right click on ●), kept in %APPDATA%\PulseX\cctv.ini
 static std::string g_save_dir; static bool g_auto_record=true;
 static float g_ignore_top=0.0f;   // 09-30: ignore detections + motion ABOVE this normalized y (0 = off), cctv.ini ignore_top
-static std::string settings_path(){ const char* a=std::getenv("APPDATA"); return std::string(a&&*a? a : ".")+"\\PulseX\\cctv.ini"; }
+static std::string settings_path(){ std::string a=env_u8(L"APPDATA"); return (a.empty()? std::string(".") : a)+"\\PulseX\\cctv.ini"; }
 static void load_settings(){
-    std::ifstream f(settings_path()); std::string line;
+    std::ifstream f(std::filesystem::u8path(settings_path())); std::string line;
     while(std::getline(f,line)){ auto eq=line.find('='); if(eq==std::string::npos) continue;
         std::string k=line.substr(0,eq), v=line.substr(eq+1); while(!v.empty() && (v.back()=='\r'||v.back()==' ')) v.pop_back();
         if(k=="save_dir") g_save_dir=v; else if(k=="auto_record") g_auto_record=(v!="0");
         else if(k=="ignore_top"){ float t=(float)std::atof(v.c_str()); g_ignore_top = t<0? 0 : t>0.95f? 0.95f : t; } } }
 static void save_settings(){
-    std::error_code ec; std::filesystem::create_directories(std::filesystem::path(settings_path()).parent_path(), ec);
-    std::ofstream f(settings_path()); f<<"save_dir="<<g_save_dir<<"\nauto_record="<<(g_auto_record?1:0)<<"\nignore_top="<<g_ignore_top<<"\n"; }
+    std::error_code ec; std::filesystem::create_directories(std::filesystem::u8path(settings_path()).parent_path(), ec);
+    std::ofstream f(std::filesystem::u8path(settings_path())); f<<"save_dir="<<g_save_dir<<"\nauto_record="<<(g_auto_record?1:0)<<"\nignore_top="<<g_ignore_top<<"\n"; }
 static std::string clips_dir(){
-    if(const char* e=std::getenv("PULSECORE_CCTV_REC_DIR")){ if(*e) return e; }
+    { std::string e=env_u8(L"PULSECORE_CCTV_REC_DIR"); if(!e.empty()) return e; }
     if(!g_save_dir.empty()) return g_save_dir;
-    if(const char* up=std::getenv("USERPROFILE")){ if(*up) return std::string(up)+"\\Videos\\PulseX CCTV"; }
+    { std::string v=known_folder_u8(FOLDERID_Videos); if(!v.empty()) return v+"\\PulseX CCTV"; }
     return exe_dir()+"\\clips"; }
 static std::string snapshots_dir(){
-    if(const char* e=std::getenv("PULSECORE_SNAPSHOTS")){ if(*e) return e; }
+    { std::string e=env_u8(L"PULSECORE_SNAPSHOTS"); if(!e.empty()) return e; }
     if(!g_save_dir.empty()) return g_save_dir;
-    if(const char* up=std::getenv("USERPROFILE")){ if(*up) return std::string(up)+"\\Pictures\\PulseCore CCTV"; }
+    { std::string p=known_folder_u8(FOLDERID_Pictures); if(!p.empty()) return p+"\\PulseX CCTV"; }
     return exe_dir()+"\\snapshots";   // fallback if USERPROFILE is somehow unset
 }
 
@@ -513,9 +523,9 @@ struct Cctv {
         }
     }
 
-    // Save the current live frame as a timestamped JPEG in the user's Pictures\PulseCore CCTV folder.
+    // Save the current live frame as a timestamped JPEG in the chosen folder (default Pictures\PulseX CCTV).
     void save_photo(){
-        std::string dir=snapshots_dir(); std::error_code ec; std::filesystem::create_directories(dir,ec);
+        std::string dir=snapshots_dir(); std::error_code ec; std::filesystem::create_directories(std::filesystem::u8path(dir),ec);
         std::time_t t=std::time(nullptr); std::tm lt{}; localtime_s(&lt,&t);
         char stamp[32]; std::strftime(stamp,sizeof(stamp),"%Y%m%d_%H%M%S",&lt);
         std::string path=dir+"\\cctv_"+stamp+".jpg";
@@ -528,8 +538,8 @@ struct Cctv {
     }
     // Open the captures folder in Explorer (creating it if empty) — the "view my captures" button.
     void open_snapshots(){
-        std::string dir=snapshots_dir(); std::error_code ec; std::filesystem::create_directories(dir,ec);
-        ShellExecuteA(nullptr,"open",dir.c_str(),nullptr,nullptr,SW_SHOWNORMAL);
+        std::string dir=snapshots_dir(); std::error_code ec; std::filesystem::create_directories(std::filesystem::u8path(dir),ec);
+        ShellExecuteW(nullptr,L"open",u8w(dir).c_str(),nullptr,nullptr,SW_SHOWNORMAL);
     }
 
     // Reader thread: pull fixed-size RAW RGBA frames off the pipe (no decode needed) straight to the display buffer.
@@ -752,7 +762,8 @@ static void draw_dock(bool af, bool em, int ds){
                   if(SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog,nullptr,CLSCTX_INPROC_SERVER,IID_PPV_ARGS(&dlg)))){
                       DWORD o=0; dlg->GetOptions(&o); dlg->SetOptions(o|FOS_PICKFOLDERS|FOS_FORCEFILESYSTEM|FOS_PATHMUSTEXIST);
                       dlg->SetTitle(L"Where should PulseX CCTV save clips and photos?");
-                      IShellItem* si=nullptr; std::wstring ws(start.begin(),start.end());
+                      IShellItem* si=nullptr; std::wstring ws=u8w(start);          // v0.2: UTF-8, and the nearest folder that exists
+                      while(!ws.empty() && GetFileAttributesW(ws.c_str())==INVALID_FILE_ATTRIBUTES){ auto k=ws.find_last_of(L"\\/"); if(k==std::wstring::npos || k<3) break; ws.resize(k); }
                       if(SUCCEEDED(SHCreateItemFromParsingName(ws.c_str(),nullptr,IID_PPV_ARGS(&si)))){ dlg->SetFolder(si); si->Release(); }
                       if(SUCCEEDED(dlg->Show(owner))){ IShellItem* r=nullptr;
                           if(SUCCEEDED(dlg->GetResult(&r))){ PWSTR p=nullptr;
@@ -770,7 +781,7 @@ static void draw_dock(bool af, bool em, int ds){
       at(GAP); if(dock_btn("##sr", B, so, so? "AI sharpening on (QuickSRNet on the NPU, when zoomed in) - click to turn off"
                                             : "AI sharpening on the NPU when zoomed in (QuickSRNet)", ic_spark)) g.sr_on.store(!so); }
     if(rz){ at(GAP); if(dock_btn("##rz", B, false, "Reset zoom", ic_zoom)){ g.m_cx=0.5f; g.m_cy=0.5f; g.m_h=0.5f; } }
-    at(GAP); if(dock_btn("##info", B, g.show_info, g.show_info? "Hide the live numbers" : "Show live numbers (decode, fps, NPU)", ic_info)) g.show_info=!g.show_info;
+    at(GAP); if(dock_btn("##info", B, g.show_info, g.show_info? "Hide the live numbers" : "Show live numbers (decode, fps, NPU) \xE2\x80\x94 PulseX CCTV 0.2", ic_info)) g.show_info=!g.show_info;
     ImGui::SetCursorScreenPos(ImVec2(ImGui::GetCursorStartPos().x+ImGui::GetWindowPos().x, o.y+dock_h));
     ImGui::Dummy(ImVec2(0,8));
     // mode text, then the receipt
@@ -1060,6 +1071,7 @@ int main(int, char**){
     // 09-30: the stream starts on the first drawn frame (Media Foundation needs the D3D11 device run_app creates)
     load_settings();                                   // 09-30: storage folder + auto-record (%APPDATA%\PulseX\cctv.ini)
     g.rec.dir=clips_dir(); g.rec.armed=g_auto_record;
+    g.mlog(std::string("[cctv] PulseX CCTV ")+PULSEX_CCTV_VERSION);
     { char b[160]; std::snprintf(b,sizeof b,"[cctv] settings: auto_record %d ignore_top %.2f save_dir %s", g_auto_record?1:0, g_ignore_top,
           g_save_dir.empty()? "(default)" : "(chosen)"); g.mlog(b); }                 // 09-30: witness what cctv.ini gave
     g.rec.log=[](const std::string& m){ g.mlog(m); };
