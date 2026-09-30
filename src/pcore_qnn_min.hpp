@@ -19,6 +19,8 @@
 #include <cstdlib>
 #include <string>
 #include <mutex>
+#include <vector>
+#include <filesystem>
 
 namespace pcore_npu {
 
@@ -29,6 +31,44 @@ inline void qnn_log_cb(const char* fmt, QnnLog_Level_t lvl, uint64_t, va_list ar
     const char* p = lvl==QNN_LOG_LEVEL_ERROR? "[ERR ] " : lvl==QNN_LOG_LEVEL_WARN? "[WARN] " : lvl==QNN_LOG_LEVEL_INFO? "[INFO] " : "[DBG ] ";
     std::lock_guard<std::mutex> lk(qnn_log_mtx()); std::fputs(p,f); std::vfprintf(f,fmt,args); std::fputc('\n',f); std::fflush(f); }
 
+// 10-01: the NPU driver loads its runtime only from a folder whose path is plain ASCII. -> the folder to load QNN from:
+// the exe's own when it is ASCII (or holds no QNN files), else a copy under %ProgramData%\PulseX\npu\. Empty = failed.
+inline bool qnn_is_ascii(const std::wstring& t){ for(wchar_t c: t) if(c > 127) return false; return true; }
+inline std::wstring qnn_exe_dir(){
+    std::wstring b(32768, L'\0'); DWORD n = GetModuleFileNameW(nullptr, &b[0], (DWORD)b.size()); b.resize(n);
+    size_t k = b.find_last_of(L"\\/"); return k == std::wstring::npos ? std::wstring(L".") : b.substr(0, k); }
+inline std::wstring ascii_runtime_dir(const std::wstring& src, std::string& err){
+    if(qnn_is_ascii(src)) return src;
+    std::vector<std::wstring> files; unsigned long long h = 1469598103934665603ull;   // FNV-1a over name, size, time
+    for(const wchar_t* pat : {L"\\Qnn*.dll", L"\\libQnn*.so", L"\\libqnn*.cat"}){
+        WIN32_FIND_DATAW fd; HANDLE f = FindFirstFileW((src + pat).c_str(), &fd);
+        if(f == INVALID_HANDLE_VALUE) continue;
+        do { if(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+             files.push_back(fd.cFileName);
+             auto mix = [&](const void* p, size_t n){ for(size_t i=0;i<n;i++){ h ^= ((const unsigned char*)p)[i]; h *= 1099511628211ull; } };
+             mix(fd.cFileName, wcslen(fd.cFileName) * 2); mix(&fd.nFileSizeLow, 4); mix(&fd.nFileSizeHigh, 4); mix(&fd.ftLastWriteTime, 8);
+        } while(FindNextFileW(f, &fd));
+        FindClose(f);
+    }
+    if(files.empty()) return src;                                   // QNN comes from elsewhere (PATH): nothing to copy
+    wchar_t pd[MAX_PATH] = {}; if(!GetEnvironmentVariableW(L"ProgramData", pd, MAX_PATH)) wcscpy_s(pd, L"C:\\ProgramData");
+    wchar_t hx[24]; swprintf_s(hx, L"%016llx", h);
+    const std::wstring dst = std::wstring(pd) + L"\\PulseX\\npu\\qnn-" + hx;
+    if(!qnn_is_ascii(dst)){ err = "the NPU cannot load its files from a folder with letters outside A-Z, and ProgramData is not plain ASCII either"; return L""; }
+    std::error_code ec; std::filesystem::create_directories(dst, ec);
+    for(const auto& f : files){
+        const std::wstring a = src + L"\\" + f, b = dst + L"\\" + f;
+        WIN32_FILE_ATTRIBUTE_DATA sa{}, sb{};
+        const bool same = GetFileAttributesExW(a.c_str(), GetFileExInfoStandard, &sa) && GetFileAttributesExW(b.c_str(), GetFileExInfoStandard, &sb)
+                          && sa.nFileSizeLow == sb.nFileSizeLow && sa.nFileSizeHigh == sb.nFileSizeHigh;
+        if(!same && !CopyFileW(a.c_str(), b.c_str(), FALSE)){
+            err = "the NPU cannot load its files from a folder with letters outside A-Z, and copying them to ProgramData failed - "
+                  "move the app to a folder such as C:\\PulseX";
+            return L""; }
+    }
+    return dst;
+}
+
 class QnnHtpSession {
 public:
     QnnHtpSession() = default;
@@ -37,7 +77,17 @@ public:
 
     bool open(const wchar_t* dll = L"QnnHtp.dll"){
         if(dev_) return true;
-        lib_ = LoadLibraryW(dll); if(!lib_){ err_="cannot load QnnHtp.dll (install the Qualcomm AI Runtime / QAIRT and put its HTP libraries next to the exe or on PATH)"; return false; }
+        { const std::wstring here = qnn_exe_dir(); rt_dir_ = ascii_runtime_dir(here, err_);   // 10-01: see ascii_runtime_dir
+          if(rt_dir_.empty()) return false;
+          if(rt_dir_ != here){                                        // QnnHtp.dll + its stub + the skel from the ASCII copy
+              std::wstring old(32768, L'\0'); DWORD n = GetEnvironmentVariableW(L"ADSP_LIBRARY_PATH", &old[0], (DWORD)old.size());
+              old.resize(n < old.size() ? n : 0);
+              const std::wstring adsp = rt_dir_ + (old.empty() ? std::wstring() : L";" + old);
+              SetEnvironmentVariableW(L"ADSP_LIBRARY_PATH", adsp.c_str());   // the process block ...
+              _wputenv_s(L"ADSP_LIBRARY_PATH", adsp.c_str());                // ... and the CRT's copy
+              lib_ = LoadLibraryExW((rt_dir_ + L"\\" + dll).c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH); } }
+        if(!lib_) lib_ = LoadLibraryW(dll);
+        if(!lib_){ err_="cannot load QnnHtp.dll (install the Qualcomm AI Runtime / QAIRT and put its HTP libraries next to the exe or on PATH)"; return false; }
         using GetProviders = Qnn_ErrorHandle_t (*)(const QnnInterface_t***, uint32_t*);
         auto gp = reinterpret_cast<GetProviders>(GetProcAddress(lib_, "QnnInterface_getProviders"));
         const QnnInterface_t** pv=nullptr; uint32_t n=0;
@@ -75,6 +125,7 @@ public:
     Qnn_DeviceHandle_t    device()  const { return dev_; }
     bool perf_ok() const { return perf_ok_; }
     const std::string& error() const { return err_; }
+    const std::wstring& runtime_dir() const { return rt_dir_; }     // where QnnHtp.dll was loaded from (10-01)
 
 private:
     // DCVS v3: PERFORMANCE mode, fixed voltage corner (MAX unless PULSECORE_HTP_CORNER), DSP kept awake between executes
@@ -105,7 +156,7 @@ private:
     }
     HMODULE lib_=nullptr; const QnnInterface_t* iface_=nullptr;
     Qnn_LogHandle_t log_=nullptr; Qnn_BackendHandle_t be_=nullptr; Qnn_DeviceHandle_t dev_=nullptr;
-    bool perf_ok_=false; std::string err_;
+    bool perf_ok_=false; std::string err_; std::wstring rt_dir_;
 };
 
 } // namespace pcore_npu

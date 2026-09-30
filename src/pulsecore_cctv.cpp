@@ -41,13 +41,21 @@ using namespace pcore::gui;
 
 static std::string exe_dir(){ char b[MAX_PATH]{}; GetModuleFileNameA(nullptr,b,MAX_PATH); std::string p=b;
     auto s=p.find_last_of("\\/"); return s==std::string::npos?std::string("."):p.substr(0,s); }
-#define PULSEX_CCTV_VERSION "0.3"
+#define PULSEX_CCTV_VERSION "0.4"
 // 09-30 v0.2: every path this app builds itself is UTF-8 (the folder picker returns UTF-8; the recorder opens UTF-8)
 static std::wstring u8w(const std::string& s){ int n=MultiByteToWideChar(CP_UTF8,0,s.c_str(),(int)s.size(),nullptr,0);
     std::wstring w(n,L'\0'); if(n) MultiByteToWideChar(CP_UTF8,0,s.c_str(),(int)s.size(),&w[0],n); return w; }
 static std::string w2u8(const wchar_t* w){ if(!w) return std::string(); int n=WideCharToMultiByte(CP_UTF8,0,w,-1,nullptr,0,nullptr,nullptr);
     std::string r(n>0? n-1 : 0,'\0'); if(n>1) WideCharToMultiByte(CP_UTF8,0,w,-1,&r[0],n,nullptr,nullptr); return r; }
 static std::string env_u8(const wchar_t* name){ const wchar_t* v=_wgetenv(name); return (v && *v)? w2u8(v) : std::string(); }
+// 10-01: a line from a file the user wrote by hand -> UTF-8. Drops a UTF-8 BOM; text that is not valid UTF-8 was saved
+// as Windows-1252 (the old Notepad default) and is converted. ASCII passes unchanged.
+static std::string text_to_utf8(std::string t){
+    if(t.size()>=3 && (unsigned char)t[0]==0xEF && (unsigned char)t[1]==0xBB && (unsigned char)t[2]==0xBF) t.erase(0,3);
+    if(t.empty() || MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, t.c_str(), (int)t.size(), nullptr, 0) > 0) return t;
+    const int n=MultiByteToWideChar(1252, 0, t.c_str(), (int)t.size(), nullptr, 0);
+    std::wstring w(n, L'\0'); if(n) MultiByteToWideChar(1252, 0, t.c_str(), (int)t.size(), &w[0], n);
+    return w2u8(w.c_str()); }
 static std::string known_folder_u8(REFKNOWNFOLDERID id){          // Videos / Pictures, wherever the user moved them
     PWSTR p=nullptr; std::string r; if(SUCCEEDED(SHGetKnownFolderPath(id,0,nullptr,&p))) r=w2u8(p); CoTaskMemFree(p); return r; }
 // The tool bin dir (ffmpeg's working folder) is overridable; default = this exe's folder.
@@ -57,10 +65,10 @@ static std::string ffmpeg_exe(){ if(const char* e=std::getenv("PULSECORE_FFMPEG"
 // Tapo RTSP URL (rtsp://user:pass@ip:554/stream1) — from env PULSECORE_TAPO_RTSP, else a one-line file
 // tapo_rtsp.txt next to the exe. Kept OUT of the code so your Camera-Account password stays local.
 static std::string tapo_rtsp(){
-    if(const char* e=std::getenv("PULSECORE_TAPO_RTSP")){ if(*e) return e; }
-    std::ifstream f(exe_dir()+"\\tapo_rtsp.txt"); std::string u; std::getline(f,u);
+    { std::string e=env_u8(L"PULSECORE_TAPO_RTSP"); if(!e.empty()) return e; }
+    std::ifstream f(std::filesystem::u8path(exe_dir()+"\\tapo_rtsp.txt")); std::string u; std::getline(f,u);
     while(!u.empty() && (u.back()=='\r'||u.back()=='\n'||u.back()==' '||u.back()=='\t')) u.pop_back();
-    return u;
+    return text_to_utf8(u);                                           // 10-01: BOM / Windows-1252 file -> UTF-8
 }
 // The NPU YOLO context bin — overridable; defaults to the one pcore_yolo_npu.hpp ships with.
 static const char* yolo_ctx(){ if(const char* e=std::getenv("PULSECORE_YOLO_CTX")){ if(*e) return e; }
@@ -74,7 +82,7 @@ static float g_ignore_top=0.0f;   // 09-30: ignore detections + motion ABOVE thi
 static std::string settings_path(){ std::string a=env_u8(L"APPDATA"); return (a.empty()? std::string(".") : a)+"\\PulseX\\cctv.ini"; }
 static void load_settings(){
     std::ifstream f(std::filesystem::u8path(settings_path())); std::string line;
-    while(std::getline(f,line)){ auto eq=line.find('='); if(eq==std::string::npos) continue;
+    while(std::getline(f,line)){ line=text_to_utf8(line); auto eq=line.find('='); if(eq==std::string::npos) continue;   // 10-01: hand-edited ini
         std::string k=line.substr(0,eq), v=line.substr(eq+1); while(!v.empty() && (v.back()=='\r'||v.back()==' ')) v.pop_back();
         if(k=="save_dir") g_save_dir=v; else if(k=="auto_record") g_auto_record=(v!="0");
         else if(k=="ignore_top"){ float t=(float)std::atof(v.c_str()); g_ignore_top = t<0? 0 : t>0.95f? 0.95f : t; } } }
@@ -106,8 +114,9 @@ static bool point_in_poly(float x,float y,const Poly& p){        // standard ray
 static bool in_any(float x,float y,const std::vector<Poly>& ms){ for(auto& p:ms) if(point_in_poly(x,y,p)) return true; return false; }
 static std::string mask_path(){ if(const char* e=std::getenv("PULSECORE_TAPO_MASK")){ if(*e) return e; } return exe_dir()+"\\tapo_mask.txt"; }
 static std::vector<Poly> load_masks(){
-    std::vector<Poly> out; std::ifstream f(mask_path()); std::string line;
+    std::vector<Poly> out; std::ifstream f(std::filesystem::u8path(mask_path())); std::string line;
     while(std::getline(f,line)){
+        line=text_to_utf8(line);                                     // 10-01: a BOM would hide the first polygon
         if(line.empty()||line[0]=='#') continue;
         Poly poly; std::stringstream ss(line); std::string tok;
         while(ss>>tok){ auto c=tok.find(','); if(c==std::string::npos) continue;

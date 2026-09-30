@@ -3,8 +3,8 @@
 
 // 09-30: version resource (Explorer > Properties > Details; also the app's name for Windows)
 1 VERSIONINFO
-FILEVERSION 0,3,0,0
-PRODUCTVERSION 0,3,0,0
+FILEVERSION 0,4,0,0
+PRODUCTVERSION 0,4,0,0
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -14,9 +14,9 @@ BEGIN
     BEGIN
       VALUE "CompanyName", "PulseCore"
       VALUE "FileDescription", "PulseX CCTV"
-      VALUE "FileVersion", "0.3"
+      VALUE "FileVersion", "0.4"
       VALUE "ProductName", "PulseX CCTV"
-      VALUE "ProductVersion", "0.3"
+      VALUE "ProductVersion", "0.4"
       VALUE "OriginalFilename", "pulsex_cctv.exe"
       VALUE "LegalCopyright", "MIT License"
     END

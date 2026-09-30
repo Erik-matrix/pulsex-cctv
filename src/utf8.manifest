@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!-- 2026-10-01: the process's ANSI code page is UTF-8 (Windows 10 1903+). zimage.py hands these programs UTF-8
+     paths (on stdin and on the command line), and ggml opens GGUF files as UTF-8, but fopen / ifstream / argv use
+     the ANSI code page: a model folder or a user name with letters outside ASCII broke the chain
+     ("failed to open GGUF file", "tokenize gave 0 tokens"). With this, every narrow path in the program is UTF-8. -->
+<assembly manifestVersion="1.0" xmlns="urn:schemas-microsoft-com:asm.v1">
+  <application>
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+    </windowsSettings>
+  </application>
+</assembly>

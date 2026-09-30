@@ -19,7 +19,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(IMGUI ${CMAKE_SOURCE_DIR}/third_party/imgui)
 
 add_executable(pulsex_cctv WIN32
-    src/pulsecore_cctv.cpp src/app.rc
+    src/pulsecore_cctv.cpp src/app.rc src/utf8.manifest   # utf8.manifest: ANSI code page = UTF-8 (paths, tapo_rtsp.txt)
     ${IMGUI}/imgui.cpp ${IMGUI}/imgui_draw.cpp ${IMGUI}/imgui_tables.cpp ${IMGUI}/imgui_widgets.cpp
     ${IMGUI}/backends/imgui_impl_win32.cpp ${IMGUI}/backends/imgui_impl_dx11.cpp)
 target_include_directories(pulsex_cctv PRIVATE

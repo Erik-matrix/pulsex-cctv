@@ -99,6 +99,17 @@ On a Tapo camera the user and password are the *camera account* made in the Tapo
 If Media Foundation cannot open the stream, the app falls back to an `ffmpeg.exe` pipe
 (`PULSECORE_FFMPEG=<path to ffmpeg.exe>`), which costs a lot more CPU.
 
+## Folder names and text files
+
+Paths may contain letters outside A–Z (Nordic, Polish, …): the app's folder, the save folder, the video path. `tapo_rtsp.txt`
+and `tapo_mask.txt` can be saved as UTF-8 (with or without a BOM) or in the old Windows encoding - both are read
+right, also a camera password with Nordic letters.
+
+One exception comes from the NPU driver: it only loads its runtime (`QnnHtp.dll`, the V73 stub and skel) from a folder
+whose path is plain A–Z. When the app sits in a folder with other letters (for example under
+`C:\Users\<a name with Nordic letters>\Downloads`), it copies those files once to `C:\ProgramData\PulseX\npu\` and loads them
+from there. To avoid the copy, keep the app in a folder such as `C:\PulseX CCTV`.
+
 ## Settings
 
 `%APPDATA%\PulseX\cctv.ini`, written by the app:
