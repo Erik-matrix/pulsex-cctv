@@ -41,7 +41,7 @@ using namespace pcore::gui;
 
 static std::string exe_dir(){ char b[MAX_PATH]{}; GetModuleFileNameA(nullptr,b,MAX_PATH); std::string p=b;
     auto s=p.find_last_of("\\/"); return s==std::string::npos?std::string("."):p.substr(0,s); }
-#define PULSEX_CCTV_VERSION "0.4"
+#define PULSEX_CCTV_VERSION "0.5"
 // 09-30 v0.2: every path this app builds itself is UTF-8 (the folder picker returns UTF-8; the recorder opens UTF-8)
 static std::wstring u8w(const std::string& s){ int n=MultiByteToWideChar(CP_UTF8,0,s.c_str(),(int)s.size(),nullptr,0);
     std::wstring w(n,L'\0'); if(n) MultiByteToWideChar(CP_UTF8,0,s.c_str(),(int)s.size(),&w[0],n); return w; }
@@ -61,6 +61,8 @@ static std::string known_folder_u8(REFKNOWNFOLDERID id){          // Videos / Pi
 // The tool bin dir (ffmpeg's working folder) is overridable; default = this exe's folder.
 static std::string bin_dir(){ if(const char* e=std::getenv("PULSECORE_BIN")){ if(*e) return e; } return exe_dir(); }
 static std::string ffmpeg_exe(){ if(const char* e=std::getenv("PULSECORE_FFMPEG")){ if(*e) return e; }
+    { std::string p=exe_dir()+"\\ffmpeg.exe"; if(GetFileAttributesA(p.c_str())!=INVALID_FILE_ATTRIBUTES) return p; }   // 10-01: next to the exe
+    { char b[MAX_PATH*2]={}; if(SearchPathA(nullptr,"ffmpeg.exe",nullptr,(DWORD)sizeof b,b,nullptr)) return b; }       // ... or on PATH
     return exe_dir()+"\\..\\tools\\ffmpeg\\ffmpeg.exe"; }
 // Tapo RTSP URL (rtsp://user:pass@ip:554/stream1) — from env PULSECORE_TAPO_RTSP, else a one-line file
 // tapo_rtsp.txt next to the exe. Kept OUT of the code so your Camera-Account password stays local.
@@ -79,16 +81,18 @@ static const char* yolo_ctx(){ if(const char* e=std::getenv("PULSECORE_YOLO_CTX"
 // 09-30: one storage folder for clips and photos, chosen by the user (right click on ●), kept in %APPDATA%\PulseX\cctv.ini
 static std::string g_save_dir; static bool g_auto_record=true;
 static float g_ignore_top=0.0f;   // 09-30: ignore detections + motion ABOVE this normalized y (0 = off), cctv.ini ignore_top
+static std::string g_camera_name;   // 10-01: optional cctv.ini camera_name, shown in the subtitle
 static std::string settings_path(){ std::string a=env_u8(L"APPDATA"); return (a.empty()? std::string(".") : a)+"\\PulseX\\cctv.ini"; }
 static void load_settings(){
     std::ifstream f(std::filesystem::u8path(settings_path())); std::string line;
     while(std::getline(f,line)){ line=text_to_utf8(line); auto eq=line.find('='); if(eq==std::string::npos) continue;   // 10-01: hand-edited ini
         std::string k=line.substr(0,eq), v=line.substr(eq+1); while(!v.empty() && (v.back()=='\r'||v.back()==' ')) v.pop_back();
         if(k=="save_dir") g_save_dir=v; else if(k=="auto_record") g_auto_record=(v!="0");
+        else if(k=="camera_name") g_camera_name=v;
         else if(k=="ignore_top"){ float t=(float)std::atof(v.c_str()); g_ignore_top = t<0? 0 : t>0.95f? 0.95f : t; } } }
 static void save_settings(){
     std::error_code ec; std::filesystem::create_directories(std::filesystem::u8path(settings_path()).parent_path(), ec);
-    std::ofstream f(std::filesystem::u8path(settings_path())); f<<"save_dir="<<g_save_dir<<"\nauto_record="<<(g_auto_record?1:0)<<"\nignore_top="<<g_ignore_top<<"\n"; }
+    std::ofstream f(std::filesystem::u8path(settings_path())); f<<"save_dir="<<g_save_dir<<"\nauto_record="<<(g_auto_record?1:0)<<"\nignore_top="<<g_ignore_top<<"\n"; if(!g_camera_name.empty()) f<<"camera_name="<<g_camera_name<<"\n"; }
 static std::string clips_dir(){
     { std::string e=env_u8(L"PULSECORE_CCTV_REC_DIR"); if(!e.empty()) return e; }
     if(!g_save_dir.empty()) return g_save_dir;
@@ -804,7 +808,10 @@ static void draw_dock(bool af, bool em, int ds){
       ImGui::PopStyleVar(3); }
     sep();
     { bool so=g.sr_on.load();
-      at(GAP); if(dock_btn("##sr", B, so, so? "AI sharpening on (QuickSRNet on the NPU, when zoomed in) - click to turn off"
+      static const bool sr_model=[](){ const bool f=GetFileAttributesW(u8w(sr_ctx()).c_str())!=INVALID_FILE_ATTRIBUTES;   // 10-01
+          g.mlog(std::string("[cctv] sharpening model: ")+(f? "found" : "missing - the button says so")); return f; }();
+      at(GAP); if(dock_btn("##sr", B, so, !sr_model? "AI sharpening needs models\\quicksrnetlarge_288x512_ctx_qnn.bin next to the app (see README)"
+                                            : so? "AI sharpening on (QuickSRNet on the NPU, when zoomed in) - click to turn off"
                                             : "AI sharpening on the NPU when zoomed in (QuickSRNet)", ic_spark)) g.sr_on.store(!so); }
     if(rz){ at(GAP); if(dock_btn("##rz", B, false, "Reset zoom", ic_zoom)){ g.m_cx=0.5f; g.m_cy=0.5f; g.m_h=0.5f; } }
     at(GAP); if(dock_btn("##info", B, g.show_info, g.show_info? "Hide the live numbers" : "Show live numbers (decode, fps, NPU) \xE2\x80\x94 PulseX CCTV " PULSEX_CCTV_VERSION, ic_info)) g.show_info=!g.show_info;
@@ -875,7 +882,13 @@ static void draw_cctv(){
       if(!sr_hook){ sr_hook=true; if(const char* e=std::getenv("PULSECORE_CCTV_TEST_SR")){ float a=0.5f,b=0.5f,c=0.18f;
           if(std::sscanf(e,"%f,%f,%f",&a,&b,&c)>=1){ g.m_cx=a; g.m_cy=b; g.m_h=c; g.sr_on.store(true); } } } }
     ImGui::Dummy(ImVec2(0,4));
-    ImGui::TextDisabled("Tapo C220 (RTSP live)");
+    { static const std::string src=tapo_rtsp();                    // 10-01: what is shown, never the address
+      std::string sub = g_camera_name.empty()? std::string() : g_camera_name+" \xC2\xB7 ";
+      sub += src.empty()? "no camera set (tapo_rtsp.txt)" : (src.find("://")==std::string::npos? "video file" : "RTSP live");
+      const int sw = g.mf? g.mf->W : g.last_w, sh = g.mf? g.mf->H : g.last_h;
+      if(sw>0 && sh>0){ char b[48]; std::snprintf(b,sizeof b," \xC2\xB7 %d \xC3\x97 %d",sw,sh); sub+=b; }
+      ImGui::TextDisabled("%s", sub.c_str());
+      { static std::string logged; if(sub!=logged){ logged=sub; g.mlog("[cctv] subtitle: "+sub); } } }   // witness (10-01)
     ImGui::Dummy(ImVec2(0,6));
     // LIVE: take the freshest decoded frame from the pipe reader — no file, no reader/writer lock.
     g.t_mark(2,"window: first draw");

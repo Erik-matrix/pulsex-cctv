@@ -96,8 +96,8 @@ rtsp://USER:PASSWORD@CAMERA-IP:554/stream1
 On a Tapo camera the user and password are the *camera account* made in the Tapo app
 (Advanced settings → Camera account), not your TP-Link login.
 
-If Media Foundation cannot open the stream, the app falls back to an `ffmpeg.exe` pipe
-(`PULSECORE_FFMPEG=<path to ffmpeg.exe>`), which costs a lot more CPU.
+If Media Foundation cannot open the stream, the app falls back to an `ffmpeg.exe` pipe, which costs a lot more
+CPU. It uses `PULSECORE_FFMPEG=<path to ffmpeg.exe>` if set, else an `ffmpeg.exe` next to the app, else one on `PATH`.
 
 ## Folder names and text files
 
@@ -119,6 +119,7 @@ from there. To avoid the copy, keep the app in a folder such as `C:\PulseX CCTV`
 | `save_dir` | folder for clips and photos (folder button → Choose folder…) |
 | `auto_record` | 1 = record passers-by |
 | `ignore_top` | without exclusion zones: ignore everything above this height (0–0.95 of the picture, 0 = off) |
+| `camera_name` | optional: a name shown under the title, before "RTSP live" and the picture size (the camera's address is never shown) |
 
 Exclusion zones are stored in `tapo_mask.txt` next to the exe.
 
