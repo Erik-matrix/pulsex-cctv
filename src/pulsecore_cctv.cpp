@@ -41,7 +41,7 @@ using namespace pcore::gui;
 
 static std::string exe_dir(){ char b[MAX_PATH]{}; GetModuleFileNameA(nullptr,b,MAX_PATH); std::string p=b;
     auto s=p.find_last_of("\\/"); return s==std::string::npos?std::string("."):p.substr(0,s); }
-#define PULSEX_CCTV_VERSION "0.5"
+#define PULSEX_CCTV_VERSION "0.6"
 // 09-30 v0.2: every path this app builds itself is UTF-8 (the folder picker returns UTF-8; the recorder opens UTF-8)
 static std::wstring u8w(const std::string& s){ int n=MultiByteToWideChar(CP_UTF8,0,s.c_str(),(int)s.size(),nullptr,0);
     std::wstring w(n,L'\0'); if(n) MultiByteToWideChar(CP_UTF8,0,s.c_str(),(int)s.size(),&w[0],n); return w; }
@@ -321,7 +321,8 @@ struct Cctv {
         unsigned long long done_seq=0;
         while(sr_run.load()){
             if(!sr_on.load() || det_state.load()!=1){ Sleep(60); continue; }
-            if(sr_state.load()==0){ std::lock_guard<std::mutex> lk(npu_mtx); sr_state.store(sr.load(det_,sr_ctx())? 1 : 2); }
+            if(sr_state.load()==0){ std::lock_guard<std::mutex> lk(npu_mtx); sr_state.store(sr.load(det_,sr_ctx())? 1 : 2);
+                mlog("[sr] "+std::string(sr_state.load()==1? "ready: " : "unavailable: ")+(sr.info.empty()? std::string("the context could not be opened") : sr.info)); }
             if(sr_state.load()!=1){ Sleep(200); continue; }
             float r[4]; bool want; { std::lock_guard<std::mutex> lk(sr_mtx); want=sr_want; std::memcpy(r,sr_req,sizeof r); }
             FrameBuf fb; int fw_=0,fh_=0; unsigned long long sq=0; float rc[4]={r[0],r[1],r[2],r[3]};

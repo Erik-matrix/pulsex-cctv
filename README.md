@@ -80,9 +80,12 @@ The detector reads the graph's inputs and outputs from the binary itself, so flo
 (u8/u16) contexts both work as long as the outputs are boxes `[1,8400,4]`, scores `[1,8400]` and
 classes `[1,8400]`. The QAIRT runtime should be the version the context was compiled with, or newer.
 
-AI sharpening needs a QuickSRNet-Large context (`models\quicksrnetlarge_288x512_ctx_qnn.bin`,
-288 × 512 in, ×4 out). It currently expects the graph produced by ONNX Runtime's QNN execution
-provider; without it the ✦ button simply does nothing.
+AI sharpening needs a QuickSRNet-Large QNN context in `models\quicksrnetlarge_288x512_ctx_qnn.bin`: one 8-bit
+image in, NCHW `1 × 3 × 288 × 512`, and one out, `1 × 3 × 1152 × 2048`, both with scale 1/255. The graph and tensor
+names are read from the file. One way to make it: take *QuickSRNetLarge* (ONNX, w8a8) from Qualcomm AI Hub, set its
+input to `1 × 3 × 288 × 512` (and re-infer the shapes), and open it once with ONNX Runtime's QNN execution provider
+with `ep.context_enable=1` — the `_ctx_qnn.bin` it writes is the file. A context that does not fit is refused with the
+reason in `%TEMP%\pulsecore_cctv_mf.log`, and without one the ✦ tooltip names the missing file.
 
 ## Camera
 
