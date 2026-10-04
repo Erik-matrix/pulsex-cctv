@@ -222,6 +222,7 @@ struct Cctv {
     // last frame handed to the display — kept so "Take photo" can save exactly what's on screen (a pointer, no copy).
     FrameBuf last_rgba; int last_w=0,last_h=0; unsigned long long shown_seq=0;
     std::string saved_msg; double saved_at=-1e9;
+    double photo_flash_at=-1e9; bool photo_ok=false; std::string photo_path;    // 10-04: the flash and the card
     bool show_info=[](){ const char* e=std::getenv("PULSECORE_CCTV_INFO"); return e && *e=='1'; }();   // 09-30: numbers on demand
 
     // ── in-app decode (09-30): Media Foundation + D3D11 video processor; ffmpeg pipe = fallback ──
@@ -547,6 +548,7 @@ struct Cctv {
         if(px && !px->empty() && w>0 && h>0) ok=stbi_write_jpg(path.c_str(), w, h, 4, px->data(), 92);  // stb takes RGB from RGBA
         saved_msg = ok ? ("Saved "+path) : (!px? std::string("No frame to save yet\xE2\x80\xA6") : ("Write failed: "+path));
         saved_at=ImGui::GetTime();
+        photo_ok=ok!=0; photo_path=path; photo_flash_at=ImGui::GetTime();
     }
     // Open the captures folder in Explorer (creating it if empty) — the "view my captures" button.
     void open_snapshots(){
@@ -1075,6 +1077,40 @@ static void draw_cctv(){
                 g.m_cx-=dd.x/rw*(u1-u0); g.m_cy-=dd.y/rh*(v1-v0);
             }
         }
+        // 10-04: a photo taken - the flash, then a card that says where it went
+        { const double el=ImGui::GetTime()-g.photo_flash_at;
+          if(el>=0 && el<4.0){
+            ImDrawList* dl=ImGui::GetWindowDrawList();      // (the window's: the buttons below draw on top)
+            if(g.photo_ok && el<0.35){ const int a=(int)(230*(1.0-el/0.35)); dl->AddRectFilled(p0,p1,IM_COL32(255,255,255,a),12.0f); }
+            const float fade=(float)(el<3.6? 1.0 : (4.0-el)/0.4);
+            const float cw=360.0f, ch=g.photo_ok? 112.0f : 76.0f, m=14.0f;
+            const ImVec2 c0(p1.x-cw-m, p1.y-ch-m), c1(p1.x-m, p1.y-m);
+            const ImU32 bg = g.photo_ok? IM_COL32(32,36,42,(int)(235*fade)) : IM_COL32(120,36,36,(int)(235*fade));
+            dl->AddRectFilled(c0,c1,bg,10.0f);
+            dl->AddRect(c0,c1,IM_COL32(110,210,180,(int)(200*fade)),10.0f,0,1.5f);
+            const std::string full=g.photo_path; const size_t sl=full.find_last_of("\\/");
+            const std::string name= sl==std::string::npos? full : full.substr(sl+1), dir= sl==std::string::npos? std::string() : full.substr(0,sl);
+            float tx=c0.x+14.0f;
+            if(g.photo_ok){                                 // a small preview of the frame (what was saved: what is on screen)
+                const float th=ch-28.0f, tw=th*vw/(float)vh;
+                dl->AddImageRounded((ImTextureID)vtex, ImVec2(c0.x+14.0f,c0.y+14.0f), ImVec2(c0.x+14.0f+tw,c0.y+14.0f+th), ImVec2(u0,v0), ImVec2(u1,v1), IM_COL32(255,255,255,(int)(255*fade)), 6.0f);
+                tx=c0.x+28.0f+tw; }
+            const ImU32 tc=IM_COL32(240,244,248,(int)(255*fade)), dc=IM_COL32(170,180,192,(int)(255*fade));
+            dl->AddText(ImVec2(tx,c0.y+12.0f), tc, g.photo_ok? "Photo saved" : "Photo not saved");
+            dl->AddText(ImVec2(tx,c0.y+34.0f), dc, g.photo_ok? name.c_str() : g.saved_msg.c_str());
+            if(g.photo_ok){
+                std::string d2=dir; if(d2.size()>34) d2="\xE2\x80\xA6"+d2.substr(d2.size()-33);
+                dl->AddText(ImVec2(tx,c0.y+52.0f), dc, d2.c_str());
+                const ImVec2 keep=ImGui::GetCursorScreenPos();
+                ImGui::SetCursorScreenPos(ImVec2(tx,c1.y-34.0f));
+                ImGui::PushStyleVar(ImGuiStyleVar_Alpha, fade);
+                if(ImGui::SmallButton("Open##photo")) ShellExecuteW(nullptr,L"open",u8w(g.photo_path).c_str(),nullptr,nullptr,SW_SHOWNORMAL);
+                ImGui::SameLine();
+                if(ImGui::SmallButton("Folder##photo")){ const std::wstring arg=L"/select,\""+u8w(g.photo_path)+L"\"";
+                    ShellExecuteW(nullptr,L"open",L"explorer.exe",arg.c_str(),nullptr,SW_SHOWNORMAL); }
+                ImGui::PopStyleVar();
+                ImGui::SetCursorScreenPos(keep); }
+          } }
     } else {
         ImGui::Dummy(ImVec2(0,20));
         ImGui::TextDisabled("Connecting to the camera\xE2\x80\xA6");
